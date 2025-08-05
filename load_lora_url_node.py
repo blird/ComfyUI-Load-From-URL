@@ -3,6 +3,7 @@ from typing import Literal
 
 from tqdm import tqdm
 import folder_paths, comfy.utils, comfy.sd
+from .utils import get_cache_path, ensure_cache_dir, download_if_needed
 
 
 # ------------------------------------------------------------
@@ -54,7 +55,7 @@ class LoadLoraFromURL:
 
     def __init__(self):
         self.cache_dir = os.path.join(folder_paths.get_input_directory(), "url_loras")
-        os.makedirs(self.cache_dir, exist_ok=True)
+        ensure_cache_dir(self.cache_dir)
 
     # ----- ComfyUI interface -----
     @classmethod
@@ -71,57 +72,13 @@ class LoadLoraFromURL:
             }
         }
 
-    # ----- internal helpers -----
-    def _target_path(self, url: str) -> str:
-        return os.path.join(
-            self.cache_dir, hashlib.md5(url.encode()).hexdigest() + ".safetensors"
-        )
-
-    def _download_aria2(self, url: str, dest: str):
-        subprocess.run([
-            "aria2c", "-x16", "-s16", "-k8M",
-            "--file-allocation=none", "--retry-wait=1", "--max-tries=5",
-            "-o", os.path.basename(dest), "-d", os.path.dirname(dest), url
-        ], check=True)
-
-    def _download_python(self, url: str, dest: str):
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(dest, "wb") as f, tqdm(
-                desc=os.path.basename(dest), total=total, unit="iB", unit_scale=True
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                    bar.update(f.write(chunk))
-
-    # ----- download orchestrator -----
-    def _download_if_needed(self, url: str, preference: str):
-        dest = self._target_path(url)
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            return dest, 0.0, "cached"
-
-        tool   = _detect_downloader(url, preference)
-        start  = time.time()
-        try:
-            if tool == "aria2":
-                self._download_aria2(url, dest)
-            else:
-                self._download_python(url, dest)
-        except Exception:
-            # If aria2 fails, fall back once
-            if tool == "aria2":
-                tool = "python"
-                self._download_python(url, dest)
-            else:
-                raise
-        return dest, time.time() - start, tool
-
     # ----- public entry -----
     def load_lora(self, url, model, strength, downloader="auto"):
         try:
-            path, seconds, tool = self._download_if_needed(url, downloader)
+            dest = get_cache_path(url, self.cache_dir)
+            seconds, tool = download_if_needed(url, dest, downloader)
             print(f"[LoadLoraFromURL] Downloader: {tool}, Time: {seconds:.2f}s")
-            lora_obj  = comfy.utils.load_torch_file(path)
+            lora_obj  = comfy.utils.load_torch_file(dest)
             model_lora, _ = comfy.sd.load_lora_for_models(
                 model, None, lora_obj, strength, 0
             )
