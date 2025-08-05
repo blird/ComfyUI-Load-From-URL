@@ -1,49 +1,8 @@
-import os, hashlib, shutil, subprocess, time, requests, re, tempfile
-from typing import Literal
-
-from tqdm import tqdm
+import os
 import cv2
 import torch
 import folder_paths
-
-# ------------------------------------------------------------
-# Quick CDN‑cache check (1 HEAD request, 200 ms)
-# ------------------------------------------------------------
-_CACHE_HIT_RE = re.compile(r"\bHIT\b", re.I)
-
-
-def _edge_is_hot(url: str, timeout: float = 2.0) -> bool:
-    """Return True if Front Door says the object is in edge cache."""
-    try:
-        r = requests.head(url, timeout=timeout)
-        # Age header present and > 0 => cached
-        if int(r.headers.get("Age", "0")) > 0:
-            return True
-        # X-Cache or X-FD-Cache-Type may say "HIT"
-        x_cache = r.headers.get("X-Cache") or r.headers.get("X-FD-Cache-Type", "")
-        return bool(_CACHE_HIT_RE.search(x_cache))
-    except Exception:
-        # If HEAD fails, fall back to assuming it's cold
-        return False
-
-
-# ------------------------------------------------------------
-# Helper: choose downloader
-# ------------------------------------------------------------
-def _detect_downloader(url: str, preference: str = "auto") -> str:
-    """
-    'auto' = python if edge‑hot, else aria2; otherwise honor explicit choice.
-    """
-    if preference != "auto":
-        return preference
-
-    # Decide based on cache state
-    is_hot = _edge_is_hot(url)
-    if is_hot:
-        return "python"  # single stream is fastest on warm cache
-    if shutil.which("aria2c"):
-        return "aria2"
-    return "python"
+from .utils import get_cache_path, ensure_cache_dir, download_if_needed
 
 
 class LoadVideoFromURL:
@@ -60,13 +19,13 @@ class LoadVideoFromURL:
     """
 
     CATEGORY = "video"
-    RETURN_TYPES = ("IMAGE", "INT", "VHS_VIDEOINFO")
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
     RETURN_NAMES = ("frames", "frame_count", "video_info")
     FUNCTION = "load_video_from_url"
 
     def __init__(self):
         self.cache_dir = os.path.join(folder_paths.get_input_directory(), "url_videos")
-        os.makedirs(self.cache_dir, exist_ok=True)
+        ensure_cache_dir(self.cache_dir)
 
     # ------- ComfyUI interface -------
     @classmethod
@@ -116,66 +75,6 @@ class LoadVideoFromURL:
             },
         }
 
-    # ------- internal helpers -------
-    def _target_path(self, url: str) -> str:
-        """Return deterministic cache path for the URL."""
-        # Retain original extension if present, fall back to .mp4
-        ext = os.path.splitext(url)[1] or ".mp4"
-        return os.path.join(
-            self.cache_dir, hashlib.md5(url.encode()).hexdigest() + ext
-        )
-
-    def _download_aria2(self, url: str, dest: str):
-        subprocess.run(
-            [
-                "aria2c",
-                "-x16",
-                "-s16",
-                "-k8M",
-                "--file-allocation=none",
-                "--retry-wait=1",
-                "--max-tries=5",
-                "-o",
-                os.path.basename(dest),
-                "-d",
-                os.path.dirname(dest),
-                url,
-            ],
-            check=True,
-        )
-
-    def _download_python(self, url: str, dest: str):
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(dest, "wb") as f, tqdm(
-                desc=os.path.basename(dest), total=total, unit="iB", unit_scale=True
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                    bar.update(f.write(chunk))
-
-    def _download_if_needed(self, url: str, preference: str):
-        dest = self._target_path(url)
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            return dest, 0.0, "cached"
-
-        tool = _detect_downloader(url, preference)
-        start = time.time()
-        try:
-            if tool == "aria2":
-                self._download_aria2(url, dest)
-            else:
-                # Treat 'python' and any unrecognised tool the same
-                self._download_python(url, dest)
-        except Exception:
-            # If aria2 fails, fall back once
-            if tool == "aria2":
-                tool = "python"
-                self._download_python(url, dest)
-            else:
-                raise
-        return dest, time.time() - start, tool
-
     # ------- public entry point -------
     def load_video_from_url(
         self,
@@ -192,13 +91,14 @@ class LoadVideoFromURL:
         # -----------------------------------------------------------------
         # 1) Download (or fetch from cache)
         # -----------------------------------------------------------------
-        path, seconds, tool = self._download_if_needed(url, downloader)
+        dest = get_cache_path(url, self.cache_dir, ".mp4")
+        seconds, tool = download_if_needed(url, dest, downloader)
         print(f"[LoadVideoURL] Downloader: {tool}, Time: {seconds:.2f}s")
 
         # -----------------------------------------------------------------
         # 2) Decode & process video
         # -----------------------------------------------------------------
-        cap = cv2.VideoCapture(path)
+        cap = cv2.VideoCapture(dest)
 
         # Get source properties
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -285,17 +185,7 @@ class LoadVideoFromURL:
 
         loaded_duration = frame_count / loaded_fps if loaded_fps else 0
 
-        video_info = {
-            "source_fps": fps,
-            "source_frame_count": total_frames,
-            "source_duration": duration,
-            "source_width": width,
-            "source_height": height,
-            "loaded_fps": loaded_fps,
-            "loaded_frame_count": frame_count,
-            "loaded_duration": loaded_duration,
-            "loaded_width": new_width,
-            "loaded_height": new_height,
-        }
-
-        return (frames, frame_count, video_info)
+        # Convert video_info dict to string for output
+        video_info_str = f"FPS: {loaded_fps:.2f}, Frames: {frame_count}, Size: {new_width}x{new_height}, Duration: {loaded_duration:.2f}s"
+        
+        return (frames, frame_count, video_info_str)
