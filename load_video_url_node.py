@@ -1,13 +1,16 @@
 import os
 import cv2
 import torch
+import subprocess
+import re
+import shutil
 import folder_paths
 from .utils import get_cache_path, ensure_cache_dir, download_if_needed
 
 
 class LoadVideoFromURL:
     """
-    Download a video from URL (with simple caching) and load it as a tensor stack.
+    Download a video from URL (with simple caching) and load it as a tensor stack with audio.
 
     Parameters
     ----------
@@ -19,8 +22,8 @@ class LoadVideoFromURL:
     """
 
     CATEGORY = "video"
-    RETURN_TYPES = ("IMAGE", "INT", "STRING")
-    RETURN_NAMES = ("frames", "frame_count", "video_info")
+    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "STRING")
+    RETURN_NAMES = ("frames", "frame_count", "audio", "video_info")
     FUNCTION = "load_video_from_url"
 
     def __init__(self):
@@ -74,6 +77,117 @@ class LoadVideoFromURL:
                 "downloader": (["auto", "aria2", "python"],),
             },
         }
+
+    def get_ffmpeg_path(self):
+        """Find FFmpeg executable."""
+        # Try system FFmpeg first
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            return ffmpeg
+        
+        # Try common locations
+        common_paths = [
+            "ffmpeg",
+            "ffmpeg.exe",
+            os.path.join(os.getcwd(), "ffmpeg"),
+            os.path.join(os.getcwd(), "ffmpeg.exe")
+        ]
+        
+        for path in common_paths:
+            if os.path.isfile(path):
+                return os.path.abspath(path)
+        
+        raise FileNotFoundError("FFmpeg not found. Please install FFmpeg or place it in your PATH.")
+
+    def extract_audio(self, video_path, start_time=0, duration=0):
+        """
+        Extract audio from video file using FFmpeg.
+        Returns a dictionary with waveform tensor and sample rate.
+        """
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        ffmpeg_path = self.get_ffmpeg_path()
+        
+        # Build FFmpeg command - extract audio stream specifically
+        args = [ffmpeg_path, "-i", video_path]
+        
+        if start_time > 0:
+            args += ["-ss", str(start_time)]
+        
+        if duration > 0:
+            args += ["-t", str(duration)]
+        
+        # Extract audio stream and convert to 32-bit float PCM
+        args += ["-vn", "-acodec", "pcm_f32le", "-ar", "44100", "-ac", "2", "-f", "f32le", "-"]
+        
+        try:
+            print(f"[LoadVideoURL] FFmpeg command: {' '.join(args)}")
+            result = subprocess.run(args, capture_output=True, check=True)
+            
+            # Convert bytes to torch tensor
+            audio_data = torch.frombuffer(bytearray(result.stdout), dtype=torch.float32)
+            
+            # Parse stderr to get sample rate and channels
+            stderr_text = result.stderr.decode('utf-8', errors='replace')
+            match = re.search(r', (\d+) Hz, (\w+)', stderr_text)
+            
+            if match:
+                sample_rate = int(match.group(1))
+                channel_layout = match.group(2)
+                channels = {"mono": 1, "stereo": 2}.get(channel_layout, 2)
+            else:
+                sample_rate = 44100
+                channels = 2
+            
+            # Reshape audio data to match VHS expectations
+            if len(audio_data) > 0:
+                # VHS expects: (batch, channels, samples)
+                audio_data = audio_data.reshape((-1, channels)).transpose(0, 1).unsqueeze(0)
+                print(f"[LoadVideoURL] Audio tensor shape: {audio_data.shape}")
+            else:
+                # Create empty audio tensor
+                audio_data = torch.zeros((1, channels, 0))
+                print(f"[LoadVideoURL] Empty audio tensor created: {audio_data.shape}")
+            
+            return {'waveform': audio_data, 'sample_rate': sample_rate}
+            
+        except subprocess.CalledProcessError as e:
+            stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else "Unknown error"
+            stdout_text = e.stdout.decode('utf-8', errors='replace') if e.stdout else "No output"
+            print(f"[LoadVideoURL] FFmpeg stderr: {stderr_text}")
+            print(f"[LoadVideoURL] FFmpeg stdout: {stdout_text}")
+            raise Exception(f"Failed to extract audio from {video_path}: {stderr_text}")
+
+    class LazyAudio:
+        """Lazy loader for audio data."""
+        def __init__(self, extract_func, video_path, start_time, duration):
+            self.extract_func = extract_func
+            self.video_path = video_path
+            self.start_time = start_time
+            self.duration = duration
+            self._data = None
+        
+        def __getitem__(self, key):
+            if self._data is None:
+                self._data = self.extract_func(self.video_path, self.start_time, self.duration)
+            return self._data[key]
+        
+        def __iter__(self):
+            if self._data is None:
+                self._data = self.extract_func(self.video_path, self.start_time, self.duration)
+            return iter(self._data)
+        
+        def __len__(self):
+            if self._data is None:
+                self._data = self.extract_func(self.video_path, self.start_time, self.duration)
+            return len(self._data)
+
+    def get_audio_from_video(self, video_path, start_time=0, duration=0):
+        """
+        Create a lazy audio loader for the video file.
+        """
+        return self.LazyAudio(self.extract_audio, video_path, start_time, duration)
 
     # ------- public entry point -------
     def load_video_from_url(
@@ -145,6 +259,20 @@ class LoadVideoFromURL:
         loaded_fps = fps / stride if fps else 0
 
         # ------------------------------------------------------------
+        # Calculate timing for audio extraction
+        # ------------------------------------------------------------
+        target_frame_time = 1.0 / loaded_fps if loaded_fps else 0
+        start_time = skip_first_frames / fps if fps else 0
+        
+        # Calculate audio duration based on loaded frames
+        if frame_load_cap > 0:
+            audio_duration = frame_load_cap * target_frame_time
+        else:
+            # Calculate how many frames we'll actually load
+            available_frames = (total_frames - skip_first_frames) // stride
+            audio_duration = available_frames * target_frame_time
+
+        # ------------------------------------------------------------
         # Read frames
         # ------------------------------------------------------------
         frames = []
@@ -176,7 +304,17 @@ class LoadVideoFromURL:
         cap.release()
 
         # -----------------------------------------------------------------
-        # 3) Wrap up
+        # 3) Extract audio (eager loading for VHS compatibility)
+        # -----------------------------------------------------------------
+        try:
+            audio = self.extract_audio(dest, start_time, audio_duration)
+        except Exception as e:
+            print(f"[LoadVideoURL] Warning: Could not extract audio: {e}")
+            # Return empty audio structure that VHS can handle
+            audio = {'waveform': torch.zeros((1, 2, 0)), 'sample_rate': 44100}
+
+        # -----------------------------------------------------------------
+        # 4) Wrap up
         # -----------------------------------------------------------------
         if frame_count == 0:
             raise ValueError("No frames were loaded from the video.")
@@ -188,4 +326,9 @@ class LoadVideoFromURL:
         # Convert video_info dict to string for output
         video_info_str = f"FPS: {loaded_fps:.2f}, Frames: {frame_count}, Size: {new_width}x{new_height}, Duration: {loaded_duration:.2f}s"
         
-        return (frames, frame_count, video_info_str)
+        # Debug logging for audio
+        print(f"[LoadVideoURL] Audio extracted: {type(audio)}, keys: {list(audio.keys()) if isinstance(audio, dict) else 'Not a dict'}")
+        if isinstance(audio, dict) and 'waveform' in audio:
+            print(f"[LoadVideoURL] Audio waveform shape: {audio['waveform'].shape}, sample_rate: {audio['sample_rate']}")
+        
+        return (frames, frame_count, audio, video_info_str)
